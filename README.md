@@ -167,8 +167,3 @@ Verbose output including:
 
 For authorized security testing only. You are responsible for ensuring you have permission to test the target systems.
 
----
-
-## 📄 License
-
-Add your preferred license (e.g., MIT) in a `LICENSE` file.

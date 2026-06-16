@@ -12,13 +12,19 @@
 # - UI toggles + verbose logging (req id, injection, status/len/diff)
 # - Proxy scanning (in-scope): auto-scan traffic, dedupe by METHOD + endpoint(path)
 #
+# CHANGE (requested):
+# - Added optional logging feature (default OFF).
+#   When OFF: no "Log" tab is added, and nothing is printed/appended by _log().
+#   When ON: "Log" tab appears and logging behaves as before.
+#
 
 from burp import IBurpExtender, ITab, IContextMenuFactory, IScanIssue, IParameter, IProxyListener
 from java.util import ArrayList
 from threading import Thread, Lock
+from Queue import Queue, Full
+from collections import OrderedDict
 import traceback
 import json
-import copy
 import re
 
 from javax.swing import (
@@ -47,11 +53,33 @@ class BurpExtender(IBurpExtender, ITab, IContextMenuFactory, IProxyListener):
         self.default_payloads = ["'", '"', "%27", "%22", "`", "%2527", '\\"', "%5C%27"]
         self.default_headers = ["User-Agent","X-Forwarded-For","X-User","X-Api-Key","Authorization","Referer","Origin","X-Real-IP","X-Forwarded-Host","X-Forwarded-Proto","X-Client-IP","X-Originating-IP","X-Remote-IP","Forwarded","X-Requested-With","X-CSRF-Token","X-Auth-Token","X-Access-Token","X-User-Id","X-Username"]
 
+        # Resource limits. These keep proxy auto-scan from creating unbounded
+        # work while preserving the existing scan modes for normal requests.
+        self.max_scan_workers = 3
+        self.max_scan_queue = 100
+        self.max_scanned_cache = 10000
+        self.max_results_rows = 1000
+        self.max_body_scan_bytes = 1024 * 1024
+        self.max_deep_targets = 250
+        self.max_xml_name_payload_len = 16
+
         self._req_counter = 0
+        self._req_counter_lock = Lock()
 
         # Proxy scanning dedupe cache
         self._scanned_lock = Lock()
-        self._scanned_keys = set()  # key = "METHOD scheme://host:port/path"
+        self._scanned_keys = OrderedDict()  # key = "METHOD scheme://host:port/path"
+
+        # Bounded scan queue. Proxy traffic can be bursty; spawning a raw Thread
+        # per request causes high RAM usage because each scan holds request/body
+        # copies and response evidence until it finishes.
+        self._scan_queue = Queue(self.max_scan_queue)
+        self._start_scan_workers()
+
+        # Logging state (default OFF)
+        self._logging_enabled = False
+        self._log_panel = None
+        self.log_area = None
 
         self._init_ui()
         self._callbacks.addSuiteTab(self)
@@ -73,6 +101,12 @@ class BurpExtender(IBurpExtender, ITab, IContextMenuFactory, IProxyListener):
         # Settings
         settings_panel = JPanel()
         settings_panel.setLayout(BoxLayout(settings_panel, BoxLayout.Y_AXIS))
+
+        # NEW: Logging toggle (default OFF)
+        self.cb_enable_logging = JCheckBox("Enable logging (adds Log tab)", False)
+        self.cb_enable_logging.addActionListener(lambda e: self._apply_logging_state())
+        settings_panel.add(self.cb_enable_logging)
+        settings_panel.add(JLabel(" "))
 
         self.cb_test_param_values = JCheckBox("Test param VALUES (GET/POST/urlencoded/multipart text)", True)
         self.cb_test_param_names = JCheckBox("Test full param NAMES (GET/POST/urlencoded/multipart)", True)
@@ -103,9 +137,11 @@ class BurpExtender(IBurpExtender, ITab, IContextMenuFactory, IProxyListener):
 
         btns = JPanel()
         btns.setLayout(BoxLayout(btns, BoxLayout.X_AXIS))
+
         self.btn_clear_log = JButton("Clear log", actionPerformed=lambda e: self._clear_log())
         self.btn_clear_results = JButton("Clear results table", actionPerformed=lambda e: self._clear_results())
         self.btn_clear_scanned = JButton("Clear scanned cache", actionPerformed=lambda e: self._clear_scanned_cache())
+
         btns.add(self.btn_clear_log)
         btns.add(self.btn_clear_results)
         btns.add(self.btn_clear_scanned)
@@ -139,16 +175,74 @@ class BurpExtender(IBurpExtender, ITab, IContextMenuFactory, IProxyListener):
         results_panel.add(JScrollPane(self.result_table), BorderLayout.CENTER)
         self.tab.addTab("Found", results_panel)
 
-        # Log
+        # Log (create components, but DO NOT add tab unless enabled)
         self.log_area = JTextArea("", 20, 100)
         self.log_area.setEditable(False)
-        log_panel = JPanel(BorderLayout())
-        log_panel.add(JScrollPane(self.log_area), BorderLayout.CENTER)
-        self.tab.addTab("Log", log_panel)
+        self._log_panel = JPanel(BorderLayout())
+        self._log_panel.add(JScrollPane(self.log_area), BorderLayout.CENTER)
+
+        # Apply default logging state (OFF)
+        self._apply_logging_state()
+
+    def _tab_index_by_title(self, title):
+        try:
+            cnt = self.tab.getTabCount()
+            for i in range(cnt):
+                if self.tab.getTitleAt(i) == title:
+                    return i
+        except:
+            pass
+        return -1
+
+    def _apply_logging_state(self):
+        """
+        Sync logging checkbox -> internal flag + UI:
+        - OFF: remove Log tab, disable Clear log button, disable _log output
+        - ON : add Log tab (if missing), enable Clear log button, enable _log output
+        """
+        try:
+            enabled = False
+            try:
+                enabled = self.cb_enable_logging.isSelected()
+            except:
+                enabled = False
+
+            self._logging_enabled = True if enabled else False
+
+            # Toggle Log tab
+            idx = self._tab_index_by_title("Log")
+            if self._logging_enabled:
+                if idx < 0 and self._log_panel is not None:
+                    self.tab.addTab("Log", self._log_panel)
+            else:
+                if idx >= 0:
+                    self.tab.removeTabAt(idx)
+
+            # Toggle clear button usability
+            try:
+                self.btn_clear_log.setEnabled(self._logging_enabled)
+            except:
+                pass
+        except:
+            # If anything goes wrong, fail safe: keep logging disabled
+            self._logging_enabled = False
+            try:
+                self.btn_clear_log.setEnabled(False)
+            except:
+                pass
+            try:
+                idx2 = self._tab_index_by_title("Log")
+                if idx2 >= 0:
+                    self.tab.removeTabAt(idx2)
+            except:
+                pass
 
     def _clear_log(self):
         try:
-            self.log_area.setText("")
+            if not self._logging_enabled:
+                return
+            if self.log_area is not None:
+                self.log_area.setText("")
         except:
             pass
 
@@ -162,7 +256,7 @@ class BurpExtender(IBurpExtender, ITab, IContextMenuFactory, IProxyListener):
     def _clear_scanned_cache(self):
         try:
             with self._scanned_lock:
-                self._scanned_keys = set()
+                self._scanned_keys = OrderedDict()
             self._log("[*] Cleared scanned cache (proxy/memo).")
         except:
             self._log("[!] Failed to clear scanned cache:\n%s" % traceback.format_exc())
@@ -193,15 +287,7 @@ class BurpExtender(IBurpExtender, ITab, IContextMenuFactory, IProxyListener):
         try:
             analyzed = self._helpers.analyzeRequest(baseRequestResponse)
             key = self._make_scan_key(analyzed, baseRequestResponse.getHttpService())
-            if self._is_already_scanned(key):
-                self._log("[*] SKIP (already scanned): %s" % key)
-                return
-
-            self._mark_scanned(key)
-
-            t = Thread(target=self._scan_worker, args=(baseRequestResponse,))
-            t.daemon = True
-            t.start()
+            self._queue_scan(baseRequestResponse, key, "manual")
         except:
             self._log("[!] Failed to start scan thread:\n%s" % traceback.format_exc())
 
@@ -235,21 +321,54 @@ class BurpExtender(IBurpExtender, ITab, IContextMenuFactory, IProxyListener):
                     return
 
             key = self._make_scan_key(analyzed, rr.getHttpService())
-            if self._is_already_scanned(key):
-                return
-
-            self._mark_scanned(key)
-            self._log("[*] PROXY auto-scan: %s" % key)
-
-            t = Thread(target=self._scan_worker, args=(rr,))
-            t.daemon = True
-            t.start()
+            self._queue_scan(rr, key, "proxy")
 
         except:
             try:
                 self._log("[!] processProxyMessage error:\n%s" % traceback.format_exc())
             except:
                 pass
+
+    def _start_scan_workers(self):
+        for i in range(self.max_scan_workers):
+            t = Thread(target=self._scan_worker_loop, args=(i + 1,))
+            t.daemon = True
+            t.start()
+
+    def _scan_worker_loop(self, worker_id):
+        while True:
+            item = self._scan_queue.get()
+            try:
+                rr, key, source = item
+                self._log("[*] Worker #%d scan from %s: %s" % (worker_id, source, key))
+                self._scan_worker(rr)
+            except:
+                try:
+                    self._log("[!] Worker #%d crashed:\n%s" % (worker_id, traceback.format_exc()))
+                except:
+                    pass
+            finally:
+                try:
+                    self._scan_queue.task_done()
+                except:
+                    pass
+
+    def _queue_scan(self, baseRequestResponse, key, source):
+        if not self._reserve_scan_key(key):
+            if source != "proxy":
+                self._log("[*] SKIP (already scanned): %s" % key)
+            return
+
+        try:
+            self._scan_queue.put_nowait((baseRequestResponse, key, source))
+            self._log("[*] Queued %s scan: %s | queue=%d" %
+                      (source, key, self._scan_queue.qsize()))
+        except Full:
+            self._forget_scan_key(key)
+            self._log("[!] Scan queue full; skipped %s scan: %s" % (source, key))
+        except:
+            self._forget_scan_key(key)
+            self._log("[!] Failed to queue scan:\n%s" % traceback.format_exc())
 
     def _make_scan_key(self, analyzed, service):
         try:
@@ -290,29 +409,47 @@ class BurpExtender(IBurpExtender, ITab, IContextMenuFactory, IProxyListener):
         except:
             return False
 
-    def _mark_scanned(self, key):
+    def _reserve_scan_key(self, key):
         try:
             with self._scanned_lock:
-                self._scanned_keys.add(key)
+                if key in self._scanned_keys:
+                    return False
+                self._scanned_keys[key] = True
+                while len(self._scanned_keys) > self.max_scanned_cache:
+                    self._scanned_keys.popitem(False)
+                return True
+        except:
+            return True
+
+    def _forget_scan_key(self, key):
+        try:
+            with self._scanned_lock:
+                if key in self._scanned_keys:
+                    del self._scanned_keys[key]
         except:
             pass
 
     # ---------------- Logging ----------------
 
     def _log(self, msg):
+        # When logging is OFF: do nothing (no Log tab, no output).
+        if not getattr(self, "_logging_enabled", False):
+            return
         try:
             self._callbacks.printOutput(msg)
         except:
             pass
         try:
-            self.log_area.append(msg + "\n")
-            self.log_area.setCaretPosition(self.log_area.getDocument().getLength())
+            if self.log_area is not None:
+                self.log_area.append(msg + "\n")
+                self.log_area.setCaretPosition(self.log_area.getDocument().getLength())
         except:
             pass
 
     def _next_req_id(self):
-        self._req_counter += 1
-        return self._req_counter
+        with self._req_counter_lock:
+            self._req_counter += 1
+            return self._req_counter
 
     # ---------------- Scan worker ----------------
 
@@ -322,9 +459,12 @@ class BurpExtender(IBurpExtender, ITab, IContextMenuFactory, IProxyListener):
             service = baseRequestResponse.getHttpService()
             headers = list(analyzed.getHeaders())
             url = str(analyzed.getUrl())
+            base_req = baseRequestResponse.getRequest()
 
-            body_bytes = baseRequestResponse.getRequest()[analyzed.getBodyOffset():]
+            body_bytes = base_req[analyzed.getBodyOffset():]
             body_str = self._helpers.bytesToString(body_bytes)
+            body_len = len(body_bytes) if body_bytes is not None else 0
+            deep_body_allowed = body_len <= self.max_body_scan_bytes
 
             content_type = self._get_header_value(headers, "Content-Type")
             if content_type is None:
@@ -335,7 +475,11 @@ class BurpExtender(IBurpExtender, ITab, IContextMenuFactory, IProxyListener):
 
             self._log("[*] Start scan: %s" % url)
             self._log("[*] Content-Type: %s" % (content_type if content_type else "(none)"))
-            self._log("[*] Payloads: %d | HeadersToTest: %d" % (len(payloads), len(headers_to_test)))
+            self._log("[*] Payloads: %d | HeadersToTest: %d | BodyLen: %d" %
+                      (len(payloads), len(headers_to_test), body_len))
+            if not deep_body_allowed:
+                self._log("[*] Skipping JSON/XML/multipart deep scan: body too large (%d > %d)" %
+                          (body_len, self.max_body_scan_bytes))
 
             # 1) headers
             if self.cb_test_headers.isSelected():
@@ -355,24 +499,30 @@ class BurpExtender(IBurpExtender, ITab, IContextMenuFactory, IProxyListener):
 
             self._log("[*] Burp parsed params: %d" % len(params))
 
+            param_seen = 0
             for p in params:
+                param_seen += 1
+                if param_seen > self.max_deep_targets:
+                    self._log("[*] Param scan limit reached: %d" % self.max_deep_targets)
+                    break
+
                 ptype = p.getType()
                 pname = p.getName()
 
                 if ptype == IParameter.PARAM_COOKIE:
                     if self.cb_test_cookies.isSelected() and self.cb_test_param_values.isSelected():
                         for payload in payloads:
-                            self._test_cookie_value(url, service, analyzed, baseRequestResponse.getRequest(), p, payload)
+                            self._test_cookie_value(url, service, analyzed, base_req, p, payload)
                     continue
 
                 if ptype in [IParameter.PARAM_URL, IParameter.PARAM_BODY]:
                     if self.cb_test_param_values.isSelected():
                         for payload in payloads:
-                            self._test_param_value(url, service, analyzed, baseRequestResponse.getRequest(), p, payload)
+                            self._test_param_value(url, service, analyzed, base_req, p, payload)
 
                     if self.cb_test_param_names.isSelected():
                         for payload in payloads:
-                            self._test_param_full_name(url, service, analyzed, baseRequestResponse.getRequest(), p, payload)
+                            self._test_param_full_name(url, service, analyzed, base_req, p, payload)
 
                     if self.cb_test_bracket_segs.isSelected() and self._has_brackets(pname):
                         segs = self._extract_bracket_segments(pname)
@@ -383,20 +533,20 @@ class BurpExtender(IBurpExtender, ITab, IContextMenuFactory, IProxyListener):
                             for payload in payloads:
                                 new_name1 = self._build_name_with_injected_segment(base_name, segs, seg_idx, payload)
                                 new_name2 = self._build_name_with_injected_segment(base_name, segs, seg_idx, payload + payload)
-                                self._test_param_renamed(url, service, analyzed, baseRequestResponse.getRequest(),
+                                self._test_param_renamed(url, service, analyzed, base_req,
                                                         p, new_name1, new_name2,
                                                         "bracket-seg idx=%d" % seg_idx, payload)
 
             # 3) JSON
-            if self.cb_test_json.isSelected() and self._looks_like_json(content_type, body_str):
+            if deep_body_allowed and self.cb_test_json.isSelected() and self._looks_like_json(content_type, body_str):
                 self._test_json(url, service, analyzed, headers, body_str, payloads)
 
             # 4) XML  (FIX: parse from bytes first to avoid "unicode + encoding decl" crash)
-            if self.cb_test_xml.isSelected() and self._looks_like_xml(content_type, body_str):
+            if deep_body_allowed and self.cb_test_xml.isSelected() and self._looks_like_xml(content_type, body_str):
                 self._test_xml(url, service, analyzed, headers, body_bytes, body_str, payloads)
 
             # 5) multipart
-            if self.cb_test_multipart.isSelected() and self._looks_like_multipart(content_type):
+            if deep_body_allowed and self.cb_test_multipart.isSelected() and self._looks_like_multipart(content_type):
                 self._test_multipart(url, service, analyzed, headers, body_str, payloads, content_type)
 
             self._log("[*] Done scan: %s" % url)
@@ -470,14 +620,31 @@ class BurpExtender(IBurpExtender, ITab, IContextMenuFactory, IProxyListener):
             level = "MID"
 
         if level:
-            self.table_model.addRow([url, where, mode, payload, "%d->%d" % (s1, s2), "%d->%d" % (len1, len2), level])
+            self._add_result_row([url, where, mode, payload, "%d->%d" % (s1, s2), "%d->%d" % (len1, len2), level])
             try:
-                issue = CustomScanIssue(service, analyzed.getUrl(), [resp1, resp2], level,
+                issue = CustomScanIssue(service, analyzed.getUrl(), self._issue_messages(resp1, resp2), level,
                                         "SQLi heuristic hit. where=%s mode=%s payload=%s (status %d/%d len %d/%d)" %
                                         (where, mode, payload, s1, s2, len1, len2))
                 self._callbacks.addScanIssue(issue)
             except:
                 pass
+
+    def _add_result_row(self, row):
+        try:
+            while self.table_model.getRowCount() >= self.max_results_rows:
+                self.table_model.removeRow(0)
+            self.table_model.addRow(row)
+        except:
+            pass
+
+    def _issue_messages(self, resp1, resp2):
+        out = []
+        for rr in [resp1, resp2]:
+            try:
+                out.append(self._callbacks.saveBuffersToTempFiles(rr))
+            except:
+                out.append(rr)
+        return out
 
     # ---------------- Headers ----------------
 
@@ -589,20 +756,19 @@ class BurpExtender(IBurpExtender, ITab, IContextMenuFactory, IProxyListener):
             return
 
         paths = self._json_paths(original)
+        if len(paths) > self.max_deep_targets:
+            self._log("[*] JSON path limit: %d -> %d" % (len(paths), self.max_deep_targets))
+            paths = paths[:self.max_deep_targets]
         self._log("[*] JSON paths: %d" % len(paths))
 
         for path in paths:
             if self.cb_test_param_names.isSelected():
                 for payload in payloads:
                     try:
-                        j1 = copy.deepcopy(original)
-                        j2 = copy.deepcopy(original)
-                        if not self._json_inject(j1, path, payload, "key"):
+                        b1 = self._json_mutated_body(original, path, payload, "key")
+                        b2 = self._json_mutated_body(original, path, payload + payload, "key")
+                        if b1 is None or b2 is None:
                             continue
-                        if not self._json_inject(j2, path, payload + payload, "key"):
-                            continue
-                        b1 = json.dumps(j1, ensure_ascii=False)
-                        b2 = json.dumps(j2, ensure_ascii=False)
                         req1 = self._helpers.buildHttpMessage(headers, self._helpers.stringToBytes(b1))
                         req2 = self._helpers.buildHttpMessage(headers, self._helpers.stringToBytes(b2))
                         self._send_dual(url, service, analyzed, req1, req2,
@@ -615,14 +781,10 @@ class BurpExtender(IBurpExtender, ITab, IContextMenuFactory, IProxyListener):
             if self.cb_test_param_values.isSelected():
                 for payload in payloads:
                     try:
-                        j1 = copy.deepcopy(original)
-                        j2 = copy.deepcopy(original)
-                        if not self._json_inject(j1, path, payload, "value"):
+                        b1 = self._json_mutated_body(original, path, payload, "value")
+                        b2 = self._json_mutated_body(original, path, payload + payload, "value")
+                        if b1 is None or b2 is None:
                             continue
-                        if not self._json_inject(j2, path, payload + payload, "value"):
-                            continue
-                        b1 = json.dumps(j1, ensure_ascii=False)
-                        b2 = json.dumps(j2, ensure_ascii=False)
                         req1 = self._helpers.buildHttpMessage(headers, self._helpers.stringToBytes(b1))
                         req2 = self._helpers.buildHttpMessage(headers, self._helpers.stringToBytes(b2))
                         self._send_dual(url, service, analyzed, req1, req2,
@@ -646,48 +808,64 @@ class BurpExtender(IBurpExtender, ITab, IContextMenuFactory, IProxyListener):
                 paths.extend(self._json_paths(it, path + [i]))
         return paths
 
-    def _json_inject(self, obj, path, payload, mode):
+    def _json_mutated_body(self, obj, path, payload, mode):
         if not path:
-            return False
+            return None
         ref = obj
         for p in path[:-1]:
             try:
                 ref = ref[p]
             except:
-                return False
+                return None
         last = path[-1]
 
         if isinstance(ref, dict):
             if mode == "key":
                 if last not in ref:
-                    return False
+                    return None
                 nk = str(last) + payload
-                ref[nk] = ref[last]
+                if nk in ref and nk != last:
+                    return None
+                old_val = ref[last]
                 del ref[last]
-                return True
+                ref[nk] = old_val
+                try:
+                    return json.dumps(obj, ensure_ascii=False)
+                finally:
+                    try:
+                        del ref[nk]
+                        ref[last] = old_val
+                    except:
+                        pass
             if mode == "value":
                 if last not in ref:
-                    return False
-                v = ref[last]
-                if isinstance(v, basestring):
-                    ref[last] = v + payload
-                else:
-                    ref[last] = str(v) + payload
-                return True
+                    return None
+                old_val = ref[last]
+                try:
+                    if isinstance(old_val, basestring):
+                        ref[last] = old_val + payload
+                    else:
+                        ref[last] = str(old_val) + payload
+                    return json.dumps(obj, ensure_ascii=False)
+                finally:
+                    ref[last] = old_val
 
         if isinstance(ref, list):
             if not isinstance(last, int) or last < 0 or last >= len(ref):
-                return False
+                return None
             if mode != "value":
-                return False
-            v = ref[last]
-            if isinstance(v, basestring):
-                ref[last] = v + payload
-            else:
-                ref[last] = str(v) + payload
-            return True
+                return None
+            old_val = ref[last]
+            try:
+                if isinstance(old_val, basestring):
+                    ref[last] = old_val + payload
+                else:
+                    ref[last] = str(old_val) + payload
+                return json.dumps(obj, ensure_ascii=False)
+            finally:
+                ref[last] = old_val
 
-        return False
+        return None
 
     def _path_str(self, path):
         try:
@@ -704,7 +882,7 @@ class BurpExtender(IBurpExtender, ITab, IContextMenuFactory, IProxyListener):
         s = (body or "").strip()
         return s.startswith("<") and s.endswith(">")
 
-    def _test_xml(self, url, service, analyzed, headers, body_bytes, body_str, payloads):
+    def _test_xml_legacy(self, url, service, analyzed, headers, body_bytes, body_str, payloads):
         if ET is None:
             self._log("[!] XML lib missing")
             return
@@ -896,6 +1074,143 @@ class BurpExtender(IBurpExtender, ITab, IContextMenuFactory, IProxyListener):
                 el.text = new_text
                 return True
         return False
+
+    # Replacement XML scanner. Kept below the legacy helpers so this method
+    # overrides the earlier _test_xml definition in Jython/Python class binding.
+    def _test_xml(self, url, service, analyzed, headers, body_bytes, body_str, payloads):
+        if ET is None:
+            self._log("[!] XML lib missing")
+            return
+
+        base_root = self._xml_parse_root(body_bytes, body_str)
+        if base_root is None:
+            self._log("[!] XML parse failed")
+            return
+
+        targets = self._xml_targets(base_root)
+        if len(targets) > self.max_deep_targets:
+            self._log("[*] XML target limit: %d -> %d" % (len(targets), self.max_deep_targets))
+            targets = targets[:self.max_deep_targets]
+        self._log("[*] XML targets: %d" % len(targets))
+
+        for kind, path, name, value in targets:
+            if kind in ("tag", "attr-name") and not self.cb_test_param_names.isSelected():
+                continue
+            if kind in ("attr-value", "text") and not self.cb_test_param_values.isSelected():
+                continue
+
+            for payload in payloads:
+                try:
+                    b1 = self._xml_mutated_body(body_bytes, body_str, path, kind, name, value, payload)
+                    b2 = self._xml_mutated_body(body_bytes, body_str, path, kind, name, value, payload + payload)
+                    if b1 is None or b2 is None:
+                        continue
+
+                    req1 = self._helpers.buildHttpMessage(headers, self._helpers.stringToBytes(b1))
+                    req2 = self._helpers.buildHttpMessage(headers, self._helpers.stringToBytes(b2))
+                    where = "xml.%s:%s" % (kind, self._path_str(path))
+                    self._send_dual(url, service, analyzed, req1, req2, where, "xml-" + kind, payload,
+                                    "xml %s at %s" % (kind, self._path_str(path)),
+                                    body_preview_1=b1, body_preview_2=b2)
+                except:
+                    continue
+
+    def _xml_parse_root(self, body_bytes, body_str):
+        try:
+            if body_bytes is not None and len(body_bytes) > 0:
+                return ET.fromstring(body_bytes)
+        except:
+            pass
+        try:
+            s = body_str or ""
+            s = s.lstrip(u"\ufeff").lstrip("\xef\xbb\xbf")
+            s = re.sub(r'^\s*<\?xml[^>]*\?>\s*', '', s, flags=re.IGNORECASE)
+            return ET.fromstring(s)
+        except:
+            return None
+
+    def _xml_targets(self, root):
+        targets = []
+
+        def walk(el, path):
+            targets.append(("tag", path, el.tag, None))
+            for an in list(el.attrib.keys()):
+                targets.append(("attr-name", path, an, el.attrib.get(an, "")))
+                targets.append(("attr-value", path, an, el.attrib.get(an, "")))
+            if el.text is not None and str(el.text).strip() != "":
+                targets.append(("text", path, None, str(el.text)))
+
+            children = list(el)
+            for i in range(len(children)):
+                walk(children[i], path + [i])
+
+        walk(root, [])
+        return targets
+
+    def _xml_mutated_body(self, body_bytes, body_str, path, kind, name, value, payload):
+        root = self._xml_parse_root(body_bytes, body_str)
+        if root is None:
+            return None
+
+        el = self._xml_get_path(root, path)
+        if el is None:
+            return None
+
+        if kind == "tag":
+            new_name = self._xml_name_with_payload(name, payload)
+            if new_name is None:
+                return None
+            el.tag = new_name
+        elif kind == "attr-name":
+            if name not in el.attrib:
+                return None
+            new_name = self._xml_name_with_payload(name, payload)
+            if new_name is None or new_name in el.attrib:
+                return None
+            el.attrib[new_name] = el.attrib[name]
+            del el.attrib[name]
+        elif kind == "attr-value":
+            if name not in el.attrib:
+                return None
+            el.attrib[name] = str(value) + payload
+        elif kind == "text":
+            el.text = str(value) + payload
+        else:
+            return None
+
+        return ET.tostring(root)
+
+    def _xml_get_path(self, root, path):
+        el = root
+        for idx in path:
+            try:
+                children = list(el)
+                el = children[idx]
+            except:
+                return None
+        return el
+
+    def _xml_name_with_payload(self, name, payload):
+        if payload is None or len(payload) > self.max_xml_name_payload_len:
+            return None
+        prefix, local = self._xml_split_name(name)
+        new_local = local + payload
+        if not self._xml_is_valid_name(new_local):
+            return None
+        return prefix + new_local
+
+    def _xml_split_name(self, name):
+        s = str(name)
+        if s.startswith("{") and "}" in s:
+            p = s.rfind("}") + 1
+            return s[:p], s[p:]
+        return "", s
+
+    def _xml_is_valid_name(self, name):
+        try:
+            return re.match(r"^[A-Za-z_][A-Za-z0-9_.-]*$", str(name)) is not None
+        except:
+            return False
 
     # ---------------- multipart/form-data (best-effort) ----------------
 
